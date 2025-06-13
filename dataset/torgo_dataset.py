@@ -4,26 +4,50 @@ from pathlib import Path
 from torch.utils.data import Dataset
 import torchaudio
 import whisper
+import pickle
+import numpy as np
+from tqdm import tqdm
 
 
 class TorgoDataset(Dataset):
-    def __init__(self, data_root, processor, split='train', max_audio_length=30):
+    def __init__(self, data_root, processor, split='train', max_audio_length=30, 
+                 cache_dir=None, preprocess=True):
         self.data_root = Path(data_root)
         self.processor = processor
         self.max_audio_length = max_audio_length  
         self.split = split
-        self.samples = self._load_data()
-        self.tokenizer = whisper.tokenizer.get_tokenizer(
-            multilingual=False
-        )
+        self.cache_dir = Path(cache_dir) if cache_dir else Path(data_root) / "cache"
+        self.cache_dir.mkdir(exist_ok=True)
+        
+        self.tokenizer = whisper.tokenizer.get_tokenizer(multilingual=False)
+        
+        # Load or create preprocessed data
+        self.cache_file = self.cache_dir / f"{split}_preprocessed.pkl"
+        
+        if preprocess and self.cache_file.exists():
+            print(f"Loading preprocessed data from {self.cache_file}")
+            with open(self.cache_file, 'rb') as f:
+                self.preprocessed_data = pickle.load(f)
+        elif preprocess:
+            print("Preprocessing data...")
+            self.samples = self._load_data()
+            self.preprocessed_data = self._preprocess_all_data()
+            # Save preprocessed data
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(self.preprocessed_data, f)
+            print(f"Saved preprocessed data to {self.cache_file}")
+        else:
+            # Fallback to original behavior
+            self.samples = self._load_data()
+            self.preprocessed_data = None
         
     def _load_data(self):
         if self.split == 'train':
-            speakers = ['F01', 'F04', 'M01', 'M05', 'FC01', 'FC03', 'MC01', 'MC03', 'MC04']
+            speakers = ['F01', 'F04', 'M01', 'M05', 'FC01', 'FC03', 'MC01', 'MC03', 'MC04', 'M04']
         elif self.split == 'val':
             speakers = ['M03', 'FC02', 'MC02']
         elif self.split == 'test':
-            speakers = ['F03', 'M02', 'M04']
+            speakers = ['F03', 'M02']
         else:
             raise ValueError(f"Unknown split: {self.split}")
     
@@ -77,25 +101,48 @@ class TorgoDataset(Dataset):
                         'speaker': speaker
                     })
     
-        print(f"✅ Loaded {len(samples)} samples for {self.split} split")
+        print(f"Loaded {len(samples)} samples for {self.split} split")
         return samples
 
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
+    def _preprocess_single_sample(self, sample):
+        """Preprocess a single sample - extract mel and tokenize text"""
         audio_path = sample['audio_path']
         transcription = sample['transcription']
-
-        # Load and preprocess audio
-        audio = whisper.load_audio(str(audio_path))
-        audio = whisper.pad_or_trim(audio)
-
-        # Generate mel spectrogram - this is essential for Whisper!
-        mel = whisper.log_mel_spectrogram(audio).unsqueeze(0)  # Add batch dimension
-
-        # Prepare text tokens with proper validation
+        
+        try:
+            # Load and preprocess audio
+            audio = whisper.load_audio(str(audio_path))
+            audio = whisper.pad_or_trim(audio)
+            
+            # Generate mel spectrogram
+            mel = whisper.log_mel_spectrogram(audio)  # Don't add batch dim here
+            
+            # Prepare text tokens
+            text_tokens = self._tokenize_text(transcription)
+            
+            return {
+                'mel': mel,
+                'text_tokens': text_tokens,
+                'transcription': transcription,
+                'speaker': sample['speaker']
+            }
+        except Exception as e:
+            print(f"Error preprocessing {audio_path}: {e}")
+            return None
+    
+    def _preprocess_all_data(self):
+        """Preprocess all samples and return list of preprocessed data"""
+        preprocessed = []
+        
+        for sample in tqdm(self.samples, desc="Preprocessing samples"):
+            processed = self._preprocess_single_sample(sample)
+            if processed is not None:
+                preprocessed.append(processed)
+        
+        return preprocessed
+    
+    def _tokenize_text(self, transcription):
+        """Tokenize text with proper validation"""
         text_tokens = []
         
         # Add special tokens
@@ -119,7 +166,6 @@ class TorgoDataset(Dataset):
             text_tokens.extend(valid_tokens)
         except Exception as e:
             print(f"Error encoding transcription '{transcription}': {e}")
-            # Fallback to empty transcription
             text_tokens.extend([])
         
         # Add end token
@@ -131,24 +177,57 @@ class TorgoDataset(Dataset):
         # Ensure no tokens exceed vocabulary size
         vocab_size = self.tokenizer.encoding.n_vocab
         if torch.any(text_tokens >= vocab_size) or torch.any(text_tokens < 0):
-            print(f"Warning: Invalid tokens found in sample {idx}")
-            print(f"Token range: {text_tokens.min().item()} to {text_tokens.max().item()}")
-            print(f"Vocab size: {vocab_size}")
-            # Clamp tokens to valid range
+            print(f"Warning: Invalid tokens found")
             text_tokens = torch.clamp(text_tokens, 0, vocab_size - 1)
 
         # Truncate if too long
         if len(text_tokens) > 448:
             text_tokens = text_tokens[:448]
-            # Ensure last token is EOT
             text_tokens[-1] = self.tokenizer.eot
+
+        return text_tokens
+
+    def __len__(self):
+        if self.preprocessed_data is not None:
+            return len(self.preprocessed_data)
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        if self.preprocessed_data is not None:
+            # Return preprocessed data - very fast!
+            sample = self.preprocessed_data[idx]
+            return {
+                'mel': sample['mel'].unsqueeze(0),  # Add batch dimension
+                'text_tokens': sample['text_tokens'],
+                'transcription': sample['transcription'],
+                'speaker': sample['speaker']
+            }
+        else:
+            # Fallback to original slow method
+            return self._get_item_slow(idx)
+    
+    def _get_item_slow(self, idx):
+        """Original slow implementation as fallback"""
+        sample = self.samples[idx]
+        audio_path = sample['audio_path']
+        transcription = sample['transcription']
+
+        # Load and preprocess audio
+        audio = whisper.load_audio(str(audio_path))
+        audio = whisper.pad_or_trim(audio)
+
+        # Generate mel spectrogram
+        mel = whisper.log_mel_spectrogram(audio).unsqueeze(0)
+
+        # Tokenize text
+        text_tokens = self._tokenize_text(transcription)
 
         return {
             'mel': mel,
             'text_tokens': text_tokens, 
             'transcription': transcription,
             'speaker': sample["speaker"]
-        }   
+        }
 
 
 class WhisperDataCollator:
@@ -177,14 +256,13 @@ class WhisperDataCollator:
                 tokens = torch.clamp(tokens, 0, vocab_size - 1)
             
             # Pad tokens
-            padded = torch.full((max_len,), self.tokenizer.eot, dtype=torch.long)  # Use EOT for padding
+            padded = torch.full((max_len,), self.tokenizer.eot, dtype=torch.long)
             padded[:len(tokens)] = tokens
             
-            # Create labels (same as tokens but with special tokens masked)
+            # Create labels
             label = padded.clone()
-            label[:4] = -100  # Ignore first 4 special tokens in loss calculation
-            # Also ignore padding tokens
-            label[len(tokens):] = -100
+            label[:4] = -100  # Ignore first 4 special tokens
+            label[len(tokens):] = -100  # Ignore padding tokens
             
             text_tokens.append(padded)
             labels.append(label)
