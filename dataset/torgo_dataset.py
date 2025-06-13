@@ -7,6 +7,7 @@ import whisper
 import pickle
 import numpy as np
 from tqdm import tqdm
+import re
 
 
 class TorgoDataset(Dataset):
@@ -21,7 +22,6 @@ class TorgoDataset(Dataset):
         
         self.tokenizer = whisper.tokenizer.get_tokenizer(multilingual=False)
         
-        # Load or create preprocessed data
         self.cache_file = self.cache_dir / f"{split}_preprocessed.pkl"
         
         if preprocess and self.cache_file.exists():
@@ -32,14 +32,47 @@ class TorgoDataset(Dataset):
             print("Preprocessing data...")
             self.samples = self._load_data()
             self.preprocessed_data = self._preprocess_all_data()
-            # Save preprocessed data
             with open(self.cache_file, 'wb') as f:
                 pickle.dump(self.preprocessed_data, f)
             print(f"Saved preprocessed data to {self.cache_file}")
         else:
-            # Fallback to original behavior
             self.samples = self._load_data()
             self.preprocessed_data = None
+    
+    def _is_valid_transcription(self, transcription):
+        """Check if transcription is valid and clean it if possible"""
+        original_transcription = transcription
+        
+        if transcription.startswith('['):
+            return None, f"starts with square bracket: {transcription[:50]}"
+        
+        if ('/' in transcription or 
+            transcription.lower().endswith(('.jpg', '.png', '.gif', '.bmp', '.jpeg', '.wav', '.mp3', '.mp4', '.avi'))):
+            return None, f"contains file path: {transcription[:50]}"
+        
+        if re.search(r'x{3,}', transcription, re.IGNORECASE):
+            return None, f"contains multiple x's: {transcription[:50]}"
+        
+        if '[' in transcription and ']' in transcription:
+            # if doesnt start w/ square brackets, clear brackets and its contents and remove whitespace
+            cleaned = re.sub(r'\[.*?\]', '', transcription)
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+            transcription = cleaned
+            print(f"Cleaned transcription: '{original_transcription}' -> '{transcription}'")
+        
+        transcription = re.sub(r'[^\w\s]', '', transcription)
+        
+        # Ensure transcription is not empty after cleaning
+        if not transcription or not transcription.strip():
+            return None, f"empty after cleaning: {original_transcription[:50]}"
+        
+        # Limit transcription length
+        transcription = transcription[:448]
+        
+        # Ensure transcription is valid UTF-8
+        transcription = transcription.encode('utf-8', 'ignore').decode('utf-8')
+        
+        return transcription, None
         
     def _load_data(self):
         if self.split == 'train':
@@ -52,6 +85,8 @@ class TorgoDataset(Dataset):
             raise ValueError(f"Unknown split: {self.split}")
     
         samples = []
+        skipped_count = 0
+        skip_reasons = {}
     
         print(f"Loading data from: {self.data_root}, split: {self.split}")
     
@@ -90,24 +125,18 @@ class TorgoDataset(Dataset):
     
                     try:
                         with open(prompt_file, 'r') as f:
-                            transcription = f.read().strip()
-                        import re
-                        # Remove any unwanted characters (e.g., punctuation)
-                        transcription = re.sub(r'[^\w\s]', '', transcription)
-                        # Ensure transcription is not empty
-                        if not transcription:
-                            print(f"Empty transcription for {utt_id}, skipping")
+                            raw_transcription = f.read().strip()
+                        
+                        # Validate and clean transcription
+                        transcription, skip_reason = self._is_valid_transcription(raw_transcription)
+                        
+                        if transcription is None:
+                            skipped_count += 1
+                            skip_reasons[skip_reason] = skip_reasons.get(skip_reason, 0) + 1
                             continue
-                        # Limit transcription length
-                        transcription = transcription[:448]  # Limit to 448 characters
-                        # Ensure transcription is valid UTF-8
-                        transcription = transcription.encode('utf-8', 'ignore').decode('utf-8')
+                            
                     except Exception as e:
                         print(f"Error reading {prompt_file}: {e}")
-                        continue
-
-                    # Skip samples that contain square brackets
-                    if '[' in transcription or ']' in transcription:
                         continue
     
                     samples.append({
@@ -117,6 +146,10 @@ class TorgoDataset(Dataset):
                     })
     
         print(f"Loaded {len(samples)} samples for {self.split} split")
+        print(f"Skipped {skipped_count} samples due to invalid transcriptions:")
+        for reason, count in skip_reasons.items():
+            print(f"  - {reason}: {count} samples")
+        
         return samples
 
     def _preprocess_single_sample(self, sample):
@@ -125,14 +158,11 @@ class TorgoDataset(Dataset):
         transcription = sample['transcription']
         
         try:
-            # Load and preprocess audio
             audio = whisper.load_audio(str(audio_path))
             audio = whisper.pad_or_trim(audio)
             
-            # Generate mel spectrogram
-            mel = whisper.log_mel_spectrogram(audio)  # Don't add batch dim here
+            mel = whisper.log_mel_spectrogram(audio) 
             
-            # Prepare text tokens
             text_tokens = self._tokenize_text(transcription)
             
             return {
@@ -160,42 +190,32 @@ class TorgoDataset(Dataset):
         """Tokenize text with proper validation"""
         text_tokens = []
         
-        # Add special tokens
         text_tokens.append(self.tokenizer.sot)
         
-        # Add language token (English)
         lang_token = self.tokenizer.sot + 1 + self.tokenizer.encoding.encode("en")[0]
         text_tokens.append(lang_token)
         
-        # Add task token
         text_tokens.append(self.tokenizer.transcribe)
         
-        # Add no timestamps token
         text_tokens.append(self.tokenizer.no_timestamps)
         
-        # Encode transcription and validate tokens
         try:
             encoded_text = self.tokenizer.encoding.encode(transcription)
-            # Filter out any invalid tokens
             valid_tokens = [t for t in encoded_text if 0 <= t < self.tokenizer.encoding.n_vocab]
             text_tokens.extend(valid_tokens)
         except Exception as e:
             print(f"Error encoding transcription '{transcription}': {e}")
             text_tokens.extend([])
         
-        # Add end token
         text_tokens.append(self.tokenizer.eot)
         
-        # Convert to tensor and validate all tokens
         text_tokens = torch.tensor(text_tokens, dtype=torch.long)
         
-        # Ensure no tokens exceed vocabulary size
         vocab_size = self.tokenizer.encoding.n_vocab
         if torch.any(text_tokens >= vocab_size) or torch.any(text_tokens < 0):
             print(f"Warning: Invalid tokens found")
             text_tokens = torch.clamp(text_tokens, 0, vocab_size - 1)
 
-        # Truncate if too long
         if len(text_tokens) > 448:
             text_tokens = text_tokens[:448]
             text_tokens[-1] = self.tokenizer.eot
@@ -209,32 +229,27 @@ class TorgoDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.preprocessed_data is not None:
-            # Return preprocessed data - very fast!
             sample = self.preprocessed_data[idx]
             return {
-                'mel': sample['mel'].unsqueeze(0),  # Add batch dimension
+                'mel': sample['mel'].unsqueeze(0),  # add batch dimension 
                 'text_tokens': sample['text_tokens'],
                 'transcription': sample['transcription'],
                 'speaker': sample['speaker']
             }
         else:
-            # Fallback to original slow method
             return self._get_item_slow(idx)
     
     def _get_item_slow(self, idx):
-        """Original slow implementation as fallback"""
+        # original slow implementation, this method causes the GPU to idle alot during training
         sample = self.samples[idx]
         audio_path = sample['audio_path']
         transcription = sample['transcription']
 
-        # Load and preprocess audio
         audio = whisper.load_audio(str(audio_path))
         audio = whisper.pad_or_trim(audio)
 
-        # Generate mel spectrogram
         mel = whisper.log_mel_spectrogram(audio).unsqueeze(0)
 
-        # Tokenize text
         text_tokens = self._tokenize_text(transcription)
 
         return {
@@ -250,12 +265,10 @@ class WhisperDataCollator:
         self.tokenizer = tokenizer
 
     def __call__(self, features):
-        # Handle mel spectrograms
         mels = [f["mel"] for f in features]
         mel_batch = torch.stack(mels)  # Shape: (batch_size, 1, n_mels, time_steps)
         mel_batch = mel_batch.squeeze(1)  # Shape: (batch_size, n_mels, time_steps)
         
-        # Handle text tokens with validation
         max_len = max(len(f["text_tokens"]) for f in features)
         vocab_size = self.tokenizer.encoding.n_vocab
         
@@ -265,19 +278,16 @@ class WhisperDataCollator:
         for f in features:
             tokens = f["text_tokens"]
             
-            # Validate tokens before padding
             if torch.any(tokens >= vocab_size) or torch.any(tokens < 0):
                 print(f"Warning: Invalid tokens in batch, clamping to valid range")
                 tokens = torch.clamp(tokens, 0, vocab_size - 1)
             
-            # Pad tokens
             padded = torch.full((max_len,), self.tokenizer.eot, dtype=torch.long)
             padded[:len(tokens)] = tokens
             
-            # Create labels
             label = padded.clone()
-            label[:4] = -100  # Ignore first 4 special tokens
-            label[len(tokens):] = -100  # Ignore padding tokens
+            label[:4] = -100  
+            label[len(tokens):] = -100  
             
             text_tokens.append(padded)
             labels.append(label)
@@ -288,4 +298,3 @@ class WhisperDataCollator:
             "labels": torch.stack(labels),
             "transcripts": [f["transcription"] for f in features]
         }
-    
