@@ -197,21 +197,6 @@ class WhisperTrainer:
                         'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
                     })
                     
-                    # Evaluation
-                    if global_step > 0 and global_step % self.config.eval_steps == 0:
-                        eval_results = self.evaluate(val_loader)
-                        print(f"\nStep {global_step}:")
-                        print(f"Eval Loss: {eval_results['eval_loss']:.4f}")
-                        print(f"Eval WER: {eval_results['eval_wer']:.4f}")
-                        print(f"Sample predictions: {eval_results['predictions'][:2]}")
-                        print(f"Sample references: {eval_results['references'][:2]}")
-                        
-                        if eval_results['eval_wer'] < best_wer:
-                            best_wer = eval_results['eval_wer']
-                            self.save_model(f"best_model_wer_{best_wer:.4f}")
-                            print(f"New best WER: {best_wer:.4f}")
-                        
-                        self.model.train()
                     
                     if global_step > 0 and global_step % self.config.save_steps == 0:
                         self.save_model(f"checkpoint-{global_step}")
@@ -226,6 +211,24 @@ class WhisperTrainer:
             
             avg_train_loss = total_loss / max(len(train_loader), 1)
             print(f"Epoch {epoch+1} - Average training loss: {avg_train_loss:.4f}")
+
+            # evaluate 
+            eval_results = self.evaluate(val_loader)
+            print(f"Epoch: {epoch+1}:")
+            print(f"Eval loss: {eval_results['eval_loss']:.4f}")
+            print(f"Eval WER: {eval_results['eval_wer']:.4f}")
+            print(f"Sample preds: {eval_results['predictions'][:2]}")
+            print(f"Sample refs: {eval_results['references'][:2]}")
+
+            if eval_results['eval_wer'] < best_wer:
+                best_wer = eval_results['eval_wer']
+                self.save_model(f"best_model_epoch_{epoch+1}_wer_{best_wer:.4f}")
+                print(f"New best WER: {best_wer:.4f}")
+
+
+            self.save_model(f"epoch_{epoch+1}")
+            print(f"Saved checkpoint for epoch {epoch+1}")
+            self.model.train()
         
         final_eval = self.evaluate(val_loader)
         print(f"\nFinal Results:")
