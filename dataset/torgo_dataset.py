@@ -91,8 +91,23 @@ class TorgoDataset(Dataset):
                     try:
                         with open(prompt_file, 'r') as f:
                             transcription = f.read().strip()
+                        import re
+                        # Remove any unwanted characters (e.g., punctuation)
+                        transcription = re.sub(r'[^\w\s]', '', transcription)
+                        # Ensure transcription is not empty
+                        if not transcription:
+                            print(f"Empty transcription for {utt_id}, skipping")
+                            continue
+                        # Limit transcription length
+                        transcription = transcription[:448]  # Limit to 448 characters
+                        # Ensure transcription is valid UTF-8
+                        transcription = transcription.encode('utf-8', 'ignore').decode('utf-8')
                     except Exception as e:
                         print(f"Error reading {prompt_file}: {e}")
+                        continue
+
+                    # Skip samples that contain square brackets
+                    if '[' in transcription or ']' in transcription:
                         continue
     
                     samples.append({
@@ -273,3 +288,4 @@ class WhisperDataCollator:
             "labels": torch.stack(labels),
             "transcripts": [f["transcription"] for f in features]
         }
+    
